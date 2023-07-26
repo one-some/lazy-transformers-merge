@@ -162,6 +162,7 @@ class DeferredTensor:
         tensor.requires_grad = False
         if load_progress is not None:
             load_progress.update(nbytes)
+        gc.collect()
         return tensor
 
 
@@ -297,6 +298,9 @@ class ParameterIndex:
     def __getitem__(self, key: str) -> DeferredTensor:
         return self.deferred_tensors[key]
 
+    def __delitem__(self, key: str) -> None:
+        del self.deferred_tensors[key]
+
 
 class Model:
     def __init__(self, path: str, merge_weight: float) -> None:
@@ -330,8 +334,10 @@ class DeferredStateDict(dict):
     def __init__(self, keys: list, models: List[Model]) -> None:
         self._keys = keys
         self._models = models
+        self.update({33: 493})
 
     def items(self) -> Any:
+        print("AAAAAAAAAAAAAAAAAAAAAAAAA")
         for param_name in sorted(
             self._keys,
             # Make effecient use of checkpoint chunk cache by ordering by
@@ -341,6 +347,8 @@ class DeferredStateDict(dict):
                 self._models[0].parameter_index[key].seek_offset,
             ),
         ):
+            yield param_name, self._models[0].parameter_index[param_name]
+            continue
             merge_pool = []
             for model in self._models:
                 try:
@@ -355,7 +363,14 @@ class DeferredStateDict(dict):
                         f"[!] {model.path} does not have parameter {param_name}! Skipping..."
                     )
 
-            yield param_name, merge_tensors(merge_pool, param_name)
+            m = merge_tensors(merge_pool, param_name)
+
+            del merge_pool
+            for model in self._models:
+                del model.parameter_index[param_name]
+
+            yield param_name, m
+            _dumpmem("Yi")
 
 
 class BadArgException(Exception):
@@ -363,7 +378,55 @@ class BadArgException(Exception):
         self.message = message
         super().__init__()
 
+class DeferredPickler(pickle.Pickler):
+    def persistent_id(obj):
+        if isinstance(obj, DeferredTensor):
+            print("EVIL", obj)
+        # FIXME: the docs say that persistent_id should only return a string
+        # but torch store returns tuples. This works only in the binary protocol
+        # see
+        # https://docs.python.org/2/library/pickle.html#pickling-and-unpickling-external-objects
+        # https://github.com/python/cpython/blob/master/Lib/pickle.py#L527-L537
+        if isinstance(obj, torch.storage.TypedStorage) or torch.is_storage(obj):
 
+            if isinstance(obj, torch.storage.TypedStorage):
+                # TODO: Once we decide to break serialization FC, this case
+                # can be deleted
+                storage = obj._untyped_storage
+                storage_dtype = obj.dtype
+                storage_type_str = obj._pickle_storage_type()
+                storage_type = getattr(torch, storage_type_str)
+                storage_numel = obj._size()
+
+            else:
+                storage = obj
+                storage_dtype = torch.uint8
+                storage_type = normalize_storage_type(type(obj))
+                storage_numel = storage.nbytes()
+
+            # If storage is allocated, ensure that any other saved storages
+            # pointing to the same data all have the same dtype. If storage is
+            # not allocated, don't perform this check
+            if storage.data_ptr() != 0:
+                if storage.data_ptr() in storage_dtypes:
+                    if storage_dtype != storage_dtypes[storage.data_ptr()]:
+                        raise RuntimeError(
+                            'Cannot save multiple tensors or storages that '
+                            'view the same data as different types')
+                else:
+                    storage_dtypes[storage.data_ptr()] = storage_dtype
+
+            storage_key = id_map.setdefault(storage._cdata, str(len(id_map)))
+            location = location_tag(storage)
+            serialized_storages[storage_key] = storage
+
+            return ('storage',
+                    storage_type,
+                    storage_key,
+                    location,
+                    storage_numel)
+
+        return None
 def main():
     global load_progress
     global DEVICE_MAP
@@ -409,10 +472,20 @@ def main():
 
     _dumpmem()
     param_keys = [k for k, _ in merged_model.named_parameters()]
-    merged_model.save_pretrained(
-        args.out,
-        state_dict=DeferredStateDict(param_keys, models),
+    fake_state = DeferredStateDict(param_keys, models)
+
+    # transformers.modeling_utils.shard_checkpoint = _shard_ckpt
+    pickle.Pickler = DeferredPickler
+    torch.save(
+        fake_state,
+        args.out+"/pytorch_model.bin",
     )
+
+    # merged_model.save_pretrained(
+    #     args.out,
+    #     state_dict={},
+    #     max_shard_size="2GB",
+    # )
     _dumpmem()
 
     print("[save] Done! :^)")
