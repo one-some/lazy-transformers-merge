@@ -23,4 +23,4 @@ Tested with (packages are required but versions might be flexible):
 - `tqdm`
 
 Attribution:
-    - Tensor deferring trick and some materialization code from [KoboldAI](https://github.com/KoboldAI/KoboldAI-Client)'s lazyloader (AGPL-3.0)
+- Tensor deferring trick and some materialization code from [KoboldAI](https://github.com/KoboldAI/KoboldAI-Client)'s lazyloader (AGPL-3.0)
