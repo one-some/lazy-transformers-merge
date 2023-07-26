@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import gc
 import os
 import pickle
 import zipfile
@@ -27,6 +28,11 @@ HF_KWARGS = {
 
 load_progress = None
 
+def _dumpmem(x=None):
+    import psutil
+    max_mem_mib = psutil.Process().memory_info().rss / 1024**2
+    x = f"[{x}] " if x else ""
+    print(f"{x}Memory usage: {round(max_mem_mib, 2)}MB")
 
 def merge_tensors(targets: List[MergeTargetTensor], param_name: str) -> torch.Tensor:
     # There's probably a pretty torch function for this
@@ -226,85 +232,11 @@ class defer_tensor_load:
         torch.load = defer_tensor_load._patched_load._unpatched
 
 
-class merge_with_secondary_models:
-    class PatchedStateDict(dict):
-        """Passed into _load_state_dict_into_meta_model as `state_dict` to avoid
-        having to copy that whole super duper big function into here to patch a
-        few lines."""
-
-        def __init__(
-            self, state_dict: dict, primary_model: Model, secondary_models: List[Model]
-        ) -> None:
-            self._state_dict = state_dict
-            self._primary_model = primary_model
-            self._secondary_models = secondary_models
-
-        def items(self) -> Any:
-            for param_name, param in sorted(
-                self._state_dict.items(),
-                # Make effecient use of checkpoint chunk cache by ordering by
-                # position on disk
-                key=lambda x: (x[1].key, x[1].seek_offset),
-            ):
-                assert isinstance(param, DeferredTensor)
-
-                merge_pool = [
-                    MergeTargetTensor(
-                        param.materialize("cpu"), self._primary_model.merge_weight
-                    )
-                ]
-
-                for model in self._secondary_models:
-                    try:
-                        merge_pool.append(
-                            MergeTargetTensor(
-                                model.parameter_index[param_name].materialize(
-                                    device="cpu"
-                                ),
-                                model.merge_weight,
-                            )
-                        )
-                    except KeyError:
-                        print(
-                            f"[!] {model.path} does not have parameter {param_name}! Skipping..."
-                        )
-
-                yield param_name, merge_tensors(merge_pool, param_name)
-
-    def __init__(self, primary_model: Model, secondary_models: List[Model]) -> None:
-        self.primary_model = primary_model
-        self.secondary_models = secondary_models
-        self._unpatched_load_state_dict = (
-            transformers.modeling_utils._load_state_dict_into_meta_model
-        )
-
-    def __enter__(self) -> None:
-        def _state_dict_override(model, state_dict, *args, **kwargs):
-            return self._unpatched_load_state_dict(
-                model,
-                merge_with_secondary_models.PatchedStateDict(
-                    state_dict, self.primary_model, self.secondary_models
-                ),
-                *args,
-                **kwargs,
-            )
-
-        transformers.modeling_utils._load_state_dict_into_meta_model = (
-            _state_dict_override
-        )
-
-    def __exit__(self, *args) -> None:
-        transformers.modeling_utils._load_state_dict_into_meta_model = (
-            self._unpatched_load_state_dict
-        )
-
-
 def get_model_keys(model_path: str) -> list:
     # Not a great solution but HF decided to no longer allow `device_map` to be
     # a string (or maybe the other way around)
-    with accelerate.init_empty_weights():
-        model = AutoModelForCausalLM.from_pretrained(model_path)
-        return list(model.state_dict().keys())
+    with torch.no_grad(), accelerate.init_empty_weights(include_buffers=True):
+        return list(AutoModelForCausalLM.from_pretrained(model_path).state_dict().keys())
 
 
 class ParameterIndex:
@@ -342,9 +274,10 @@ class ParameterIndex:
 
         device_map = {k: "meta" for k in get_model_keys(path)}
 
+        _dumpmem("Pre")
         # This context manager writes DeferredTensors to `self.deferred_tensors`
         # instead of actually loading weights.
-        with defer_tensor_load(), ParameterIndex.index_tensors(self):
+        with defer_tensor_load(), ParameterIndex.index_tensors(self), torch.no_grad():
             try:
                 # Using the meta device saves a significant amount of memory over
                 # CPU, despite no weights loading (in theory). Patching in a
@@ -358,6 +291,8 @@ class ParameterIndex:
                 # Actual model load fails because weights aren't loaded (which is what we want)
                 if "is on the meta device, we need a `value`" not in str(e):
                     raise e
+        gc.collect()
+        _dumpmem("Post")
 
     def __getitem__(self, key: str) -> DeferredTensor:
         return self.deferred_tensors[key]
@@ -367,10 +302,6 @@ class Model:
     def __init__(self, path: str, merge_weight: float) -> None:
         self.path = path
         self.merge_weight = merge_weight
-
-        # This will only be populated in secondary models, since we use the
-        # Huggingface loader completely on the primary model to make sure no
-        # hooks or other stuff messes up
         self.parameter_index: Optional[ParameterIndex] = None
 
     def index_model_parameters(self) -> None:
@@ -393,6 +324,38 @@ class Model:
             )
 
         return Model(path.strip(), merge_weight)
+
+
+class DeferredStateDict(dict):
+    def __init__(self, keys: list, models: List[Model]) -> None:
+        self._keys = keys
+        self._models = models
+
+    def items(self) -> Any:
+        for param_name in sorted(
+            self._keys,
+            # Make effecient use of checkpoint chunk cache by ordering by
+            # position on disk
+            key=lambda key: (
+                self._models[0].parameter_index[key].key,
+                self._models[0].parameter_index[key].seek_offset,
+            ),
+        ):
+            merge_pool = []
+            for model in self._models:
+                try:
+                    merge_pool.append(
+                        MergeTargetTensor(
+                            model.parameter_index[param_name].materialize(device="cpu"),
+                            model.merge_weight,
+                        )
+                    )
+                except KeyError:
+                    print(
+                        f"[!] {model.path} does not have parameter {param_name}! Skipping..."
+                    )
+
+            yield param_name, merge_tensors(merge_pool, param_name)
 
 
 class BadArgException(Exception):
@@ -426,42 +389,38 @@ def main():
     models = [Model.from_arg(m) for m in args.models]
 
     merge_sum = sum([m.merge_weight for m in models])
-    if merge_sum != 1.0:
+    if abs(merge_sum - 1.0) > 0.00001:
         raise BadArgException(
             f"Expected merge weight to add up to 1.0, added up to {merge_sum}"
         )
 
     load_progress = tqdm(desc="Read", unit="B", unit_scale=True, leave=None)
 
-    # TODO: Check that config makes sense
-    primary_model = models[0]
-    secondary_models = models[1:]
-
-    for model in secondary_models:
+    _dumpmem()
+    for model in models:
         model.index_model_parameters()
-        # print(model.parameter_index.deferred_tensors)
-    print("[index] Done indexing secondary models!")
+    print("[index] Done indexing models!")
+    _dumpmem()
 
-    print(f"[merge] Merging into primary model '{primary_model.path}'...")
-    if isinstance(DEVICE_MAP, str):
-        DEVICE_MAP = {k: DEVICE_MAP for k in get_model_keys(primary_model.path)}
+    print(f"[merge] Merging into '{args.out}'...")
 
-    with defer_tensor_load(), merge_with_secondary_models(
-        primary_model, secondary_models
-    ):
-        merged_model = AutoModelForCausalLM.from_pretrained(
-            primary_model.path, device_map=DEVICE_MAP, **HF_KWARGS
-        )
+    with accelerate.init_empty_weights(include_buffers=True):
+        merged_model = AutoModelForCausalLM.from_pretrained(models[0].path)
 
-    merged_model.save_pretrained(args.out)
+    _dumpmem()
+    param_keys = [k for k, _ in merged_model.named_parameters()]
+    merged_model.save_pretrained(
+        args.out,
+        state_dict=DeferredStateDict(param_keys, models),
+    )
+    _dumpmem()
 
     print("[save] Done! :^)")
     CheckpointChunkCache.clear(cleanup=True)
 
-    # import psutil
-    # max_mem_mib = psutil.Process().memory_info().rss / 1024**2
-    # print(f"Memory usage: {round(max_mem_mib, 2)}MB")
-    # input("Enter to continue...")
+    _dumpmem()
+    input("Enter to continue...")
+
 
 
 if __name__ == "__main__":
