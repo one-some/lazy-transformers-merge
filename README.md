@@ -21,3 +21,6 @@ Tested with (packages are required but versions might be flexible):
 - `acclerate==0.21.0`
 - `torch==2.0.1`
 - `tqdm`
+
+Attribution:
+    - Tensor deferring trick and some materialization code from [KoboldAI](https://github.com/KoboldAI/KoboldAI-Client)'s lazyloader (AGPL-3.0)
