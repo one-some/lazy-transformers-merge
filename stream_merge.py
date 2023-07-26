@@ -12,8 +12,8 @@ from dataclasses import dataclass
 from io import BufferedReader
 from typing import Any, List, Optional
 
-import torch
 import accelerate
+import torch
 import transformers
 from torch.storage import UntypedStorage
 from tqdm import tqdm
@@ -258,12 +258,16 @@ class merge_with_secondary_models:
                     try:
                         merge_pool.append(
                             MergeTargetTensor(
-                                model.parameter_index[param_name].materialize(device="cpu"),
+                                model.parameter_index[param_name].materialize(
+                                    device="cpu"
+                                ),
                                 model.merge_weight,
                             )
                         )
                     except KeyError:
-                        print(f"[!] {model.path} does not have parameter {param_name}! Skipping...")
+                        print(
+                            f"[!] {model.path} does not have parameter {param_name}! Skipping..."
+                        )
 
                 yield param_name, merge_tensors(merge_pool, param_name)
 
@@ -294,12 +298,14 @@ class merge_with_secondary_models:
             self._unpatched_load_state_dict
         )
 
+
 def get_model_keys(model_path: str) -> list:
     # Not a great solution but HF decided to no longer allow `device_map` to be
     # a string (or maybe the other way around)
     with accelerate.init_empty_weights():
         model = AutoModelForCausalLM.from_pretrained(model_path)
         return list(model.state_dict().keys())
+
 
 class ParameterIndex:
     class index_tensors:
@@ -375,8 +381,9 @@ class Model:
         try:
             path, merge_weight = arg.split(":")
         except ValueError:
-            raise BadArgException("Model needs to be seperated from merge weight by colon. It should look something like this: facebook/opt-125m:0.5")
-
+            raise BadArgException(
+                "Model needs to be seperated from merge weight by colon. It should look something like this: facebook/opt-125m:0.5"
+            )
 
         try:
             merge_weight = float(merge_weight)
@@ -387,10 +394,12 @@ class Model:
 
         return Model(path.strip(), merge_weight)
 
+
 class BadArgException(Exception):
     def __init__(self, message):
         self.message = message
         super().__init__()
+
 
 def main():
     global load_progress
@@ -406,13 +415,21 @@ def main():
     parser.add_argument("--out", action="store", required=True)
 
     args = parser.parse_args()
+
+    try:
+        os.makedirs(args.out)
+    except FileExistsError:
+        raise BadArgException("Out dir already exists")
+
     if not os.path.isdir(args.out):
-        raise BadArgException("Out arg must be existing path.")
+        raise BadArgException("Unable to find out dir")
     models = [Model.from_arg(m) for m in args.models]
 
     merge_sum = sum([m.merge_weight for m in models])
     if merge_sum != 1.0:
-        raise BadArgException(f"Expected merge weight to add up to 1.0, added up to {merge_sum}")
+        raise BadArgException(
+            f"Expected merge weight to add up to 1.0, added up to {merge_sum}"
+        )
 
     load_progress = tqdm(desc="Read", unit="B", unit_scale=True, leave=None)
 
@@ -438,12 +455,14 @@ def main():
 
     merged_model.save_pretrained(args.out)
 
+    print("[save] Done! :^)")
     CheckpointChunkCache.clear(cleanup=True)
 
     # import psutil
     # max_mem_mib = psutil.Process().memory_info().rss / 1024**2
     # print(f"Memory usage: {round(max_mem_mib, 2)}MB")
     # input("Enter to continue...")
+
 
 if __name__ == "__main__":
     # Seperate function to not wrap big amount of code in ugly indentation
