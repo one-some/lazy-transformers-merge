@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import functools
 import gc
+import json
 import os
 import pickle
 import zipfile
@@ -16,9 +17,11 @@ from typing import Any, List, Optional
 import accelerate
 import torch
 import transformers
+from safetensors.torch import save_file
 from torch.storage import UntypedStorage
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM
+from transformers.modeling_utils import dtype_byte_size
 
 DEVICE_MAP = "cpu"
 MODEL_PRECISION = torch.float16
@@ -28,11 +31,14 @@ HF_KWARGS = {
 
 load_progress = None
 
+
 def _dumpmem(x=None):
     import psutil
+
     max_mem_mib = psutil.Process().memory_info().rss / 1024**2
     x = f"[{x}] " if x else ""
     print(f"{x}Memory usage: {round(max_mem_mib, 2)}MB")
+
 
 def merge_tensors(targets: List[MergeTargetTensor], param_name: str) -> torch.Tensor:
     # There's probably a pretty torch function for this
@@ -237,7 +243,9 @@ def get_model_keys(model_path: str) -> list:
     # Not a great solution but HF decided to no longer allow `device_map` to be
     # a string (or maybe the other way around)
     with torch.no_grad(), accelerate.init_empty_weights(include_buffers=True):
-        return list(AutoModelForCausalLM.from_pretrained(model_path).state_dict().keys())
+        return list(
+            AutoModelForCausalLM.from_pretrained(model_path).state_dict().keys()
+        )
 
 
 class ParameterIndex:
@@ -306,7 +314,7 @@ class Model:
     def __init__(self, path: str, merge_weight: float) -> None:
         self.path = path
         self.merge_weight = merge_weight
-        self.parameter_index: Optional[ParameterIndex] = None
+        self.parameter_index: ParameterIndex
 
     def index_model_parameters(self) -> None:
         self.parameter_index = ParameterIndex(self.path)
@@ -330,27 +338,23 @@ class Model:
         return Model(path.strip(), merge_weight)
 
 
-class DeferredStateDict(dict):
+class DeferredStateDict:
     def __init__(self, keys: list, models: List[Model]) -> None:
-        self._keys = keys
-        self._models = models
-        self.update({33: 493})
+        self.keys = keys
+        self.models = models
 
-    def items(self) -> Any:
-        print("AAAAAAAAAAAAAAAAAAAAAAAAA")
+    def lazy_items(self) -> Any:
         for param_name in sorted(
-            self._keys,
+            self.keys,
             # Make effecient use of checkpoint chunk cache by ordering by
             # position on disk
             key=lambda key: (
-                self._models[0].parameter_index[key].key,
-                self._models[0].parameter_index[key].seek_offset,
+                self.models[0].parameter_index[key].key,
+                self.models[0].parameter_index[key].seek_offset,
             ),
         ):
-            yield param_name, self._models[0].parameter_index[param_name]
-            continue
             merge_pool = []
-            for model in self._models:
+            for model in self.models:
                 try:
                     merge_pool.append(
                         MergeTargetTensor(
@@ -366,11 +370,42 @@ class DeferredStateDict(dict):
             m = merge_tensors(merge_pool, param_name)
 
             del merge_pool
-            for model in self._models:
+            for model in self.models:
                 del model.parameter_index[param_name]
 
             yield param_name, m
-            _dumpmem("Yi")
+            # _dumpmem("Yi")
+
+
+class ShardedSafetensorsSerializer:
+    def __init__(self, dir: str, split_n: int) -> None:
+        self.dir = dir
+        self.split_n = split_n
+
+        self.index_weight_map = {}
+        self.total_size = 0
+
+        self.buffer = {}
+        self.current_file_no = 0
+
+    def add_tensor(self, key: str, tensor: torch.Tensor, final: bool = False) -> None:
+        current_file_name = f"model_{self.current_file_no}.safetensors"
+
+        self.buffer[key] = tensor
+        self.total_size += tensor.numel() * dtype_byte_size(tensor.dtype)
+        self.index_weight_map[key] = current_file_name
+
+        if len(self.buffer) >= self.split_n or final:
+            self.current_file_no += 1
+            save_file(
+                self.buffer,
+                os.path.join(self.dir, current_file_name),
+                # HF gets a little angry if we don't specify this (fails in cryptic manner)
+                metadata={"format": "pt"},
+            )
+
+            del self.buffer
+            self.buffer = {}
 
 
 class BadArgException(Exception):
@@ -378,55 +413,7 @@ class BadArgException(Exception):
         self.message = message
         super().__init__()
 
-class DeferredPickler(pickle.Pickler):
-    def persistent_id(obj):
-        if isinstance(obj, DeferredTensor):
-            print("EVIL", obj)
-        # FIXME: the docs say that persistent_id should only return a string
-        # but torch store returns tuples. This works only in the binary protocol
-        # see
-        # https://docs.python.org/2/library/pickle.html#pickling-and-unpickling-external-objects
-        # https://github.com/python/cpython/blob/master/Lib/pickle.py#L527-L537
-        if isinstance(obj, torch.storage.TypedStorage) or torch.is_storage(obj):
 
-            if isinstance(obj, torch.storage.TypedStorage):
-                # TODO: Once we decide to break serialization FC, this case
-                # can be deleted
-                storage = obj._untyped_storage
-                storage_dtype = obj.dtype
-                storage_type_str = obj._pickle_storage_type()
-                storage_type = getattr(torch, storage_type_str)
-                storage_numel = obj._size()
-
-            else:
-                storage = obj
-                storage_dtype = torch.uint8
-                storage_type = normalize_storage_type(type(obj))
-                storage_numel = storage.nbytes()
-
-            # If storage is allocated, ensure that any other saved storages
-            # pointing to the same data all have the same dtype. If storage is
-            # not allocated, don't perform this check
-            if storage.data_ptr() != 0:
-                if storage.data_ptr() in storage_dtypes:
-                    if storage_dtype != storage_dtypes[storage.data_ptr()]:
-                        raise RuntimeError(
-                            'Cannot save multiple tensors or storages that '
-                            'view the same data as different types')
-                else:
-                    storage_dtypes[storage.data_ptr()] = storage_dtype
-
-            storage_key = id_map.setdefault(storage._cdata, str(len(id_map)))
-            location = location_tag(storage)
-            serialized_storages[storage_key] = storage
-
-            return ('storage',
-                    storage_type,
-                    storage_key,
-                    location,
-                    storage_numel)
-
-        return None
 def main():
     global load_progress
     global DEVICE_MAP
@@ -439,6 +426,12 @@ def main():
         help="A space-seperated list of models you want to merge, with a colon dillemeting merge ratios. Ex: 'facebook/opt-125m:0.5 notfacebook/opt-125m:0.5'",
     )
     parser.add_argument("--out", action="store", required=True)
+    parser.add_argument(
+        "--serialize_batch",
+        action="store",
+        default=64,
+        help="The max amount of parameters that can be buffered when saving the model. Increasing this may increase memory usage, while lowering the amount of individual model files saved.",
+    )
 
     args = parser.parse_args()
 
@@ -463,37 +456,51 @@ def main():
     for model in models:
         model.index_model_parameters()
     print("[index] Done indexing models!")
-    _dumpmem()
+    _dumpmem("Postindex prekeys")
 
     print(f"[merge] Merging into '{args.out}'...")
 
     with accelerate.init_empty_weights(include_buffers=True):
         merged_model = AutoModelForCausalLM.from_pretrained(models[0].path)
 
-    _dumpmem()
+    _dumpmem("postkeys")
     param_keys = [k for k, _ in merged_model.named_parameters()]
-    fake_state = DeferredStateDict(param_keys, models)
 
-    # transformers.modeling_utils.shard_checkpoint = _shard_ckpt
-    pickle.Pickler = DeferredPickler
-    torch.save(
-        fake_state,
-        args.out+"/pytorch_model.bin",
-    )
+    # Serializing time!!! Let's write to files without using a lot of RAM, ok? :^)
+    # Let's just use a bunch of tiny files and an index, as safetensors doesn't
+    # support writing single weights to file (https://github.com/huggingface/safetensors/issues/291)
 
-    # merged_model.save_pretrained(
-    #     args.out,
-    #     state_dict={},
-    #     max_shard_size="2GB",
-    # )
+    # Let's do the weights first.
+    sss = ShardedSafetensorsSerializer(args.out, split_n=args.serialize_batch)
+    for index, (key, materialized_tensor) in enumerate(
+        tqdm(
+            DeferredStateDict(param_keys, models).lazy_items(),
+            total=len(param_keys),
+            desc="tensors serialized",
+            # disable=True,
+        )
+    ):
+        sss.add_tensor(key, materialized_tensor, final=index == len(param_keys) - 1)
+
+    # We need to make an index file! This is a json file like this:
+    # {metadata: {total_size: 1337}, weight_map: ...}
+    with open(os.path.join(args.out, "model.safetensors.index.json"), "w") as file:
+        json.dump(
+            {
+                "metadata": {"total_size": sss.total_size},
+                "weight_map": sss.index_weight_map,
+            },
+            file,
+            indent=4,
+        )
+
+    # Now let's write a config.json so people know what type of model this is.
+    merged_model.config.to_json_file(os.path.join(args.out, "config.json"))
+
     _dumpmem()
-
     print("[save] Done! :^)")
     CheckpointChunkCache.clear(cleanup=True)
-
-    _dumpmem()
-    input("Enter to continue...")
-
+    # input("Enter to continue...")
 
 
 if __name__ == "__main__":
