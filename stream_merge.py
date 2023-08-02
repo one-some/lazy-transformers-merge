@@ -240,12 +240,15 @@ class defer_tensor_load:
 
 
 def get_model_keys(model_path: str) -> list:
-    # Not a great solution but HF decided to no longer allow `device_map` to be
-    # a string (or maybe the other way around)
-    with torch.no_grad(), accelerate.init_empty_weights(include_buffers=True):
-        return list(
-            AutoModelForCausalLM.from_pretrained(model_path).state_dict().keys()
-        )
+    # FIXME: This function causes RAM spikes!
+    out = []
+
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_pretrained(model_path)
+
+    for key in model.state_dict():
+        out.append(key)
+    return out
 
 
 class ParameterIndex:
@@ -283,10 +286,9 @@ class ParameterIndex:
 
         device_map = {k: "meta" for k in get_model_keys(path)}
 
-        _dumpmem("Pre")
         # This context manager writes DeferredTensors to `self.deferred_tensors`
         # instead of actually loading weights.
-        with defer_tensor_load(), ParameterIndex.index_tensors(self), torch.no_grad():
+        with torch.inference_mode(), defer_tensor_load(), ParameterIndex.index_tensors(self):
             try:
                 # Using the meta device saves a significant amount of memory over
                 # CPU, despite no weights loading (in theory). Patching in a
@@ -301,7 +303,6 @@ class ParameterIndex:
                 if "is on the meta device, we need a `value`" not in str(e):
                     raise e
         gc.collect()
-        _dumpmem("Post")
 
     def __getitem__(self, key: str) -> DeferredTensor:
         return self.deferred_tensors[key]
