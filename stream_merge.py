@@ -13,6 +13,8 @@ from io import BufferedReader
 from typing import Any, List, Optional
 
 import accelerate
+import safetensors
+import safetensors.torch
 import torch
 import transformers
 from torch.storage import UntypedStorage
@@ -87,6 +89,10 @@ class CheckpointChunkCache:
 
 
 class DeferredTensor:
+    pass
+
+
+class TorchDeferredTensor(DeferredTensor):
     def __init__(
         self,
         storage_type,
@@ -159,6 +165,25 @@ class DeferredTensor:
         return tensor
 
 
+class SafetensorsDeferredTensor(DeferredTensor):
+    def __init__(self, checkpoint_file: str, key: str, location: str):
+        self.checkpoint_file = checkpoint_file
+        self.key = key
+        self.location = location
+
+    def materialize(
+        self,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        # keeping the file handle open and reading all at once drags everything
+        # into ram, just open and close, as hacky as it is
+        with safetensors.safe_open(
+            self.checkpoint_file, framework="pt", device=self.location
+        ) as f:
+            return f.get_tensor(self.key)
+
+
 class defer_tensor_load:
     class DeferredUnpickler(pickle.Unpickler):
         def persistent_load(self, saved_id):
@@ -168,7 +193,7 @@ class defer_tensor_load:
                 typename == "storage"
             ), f"Unknown typename for persistent_load, expected 'storage' but got '{typename}'"
             storage_type, key, location, _ = saved_id[1:]
-            return DeferredTensor(storage_type, key, location)
+            return TorchDeferredTensor(storage_type, key, location)
 
     def _patched_rebuild_tensor(
         deferred_tensor: DeferredTensor,
@@ -209,9 +234,23 @@ class defer_tensor_load:
 
         return model_dict
 
+    def _patched_safetensors_load(path: str) -> dict:
+        tensors = {}
+
+        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+            for key in f.keys():
+                tensors[key] = None
+
+        for key in tensors:
+            tensors[key] = SafetensorsDeferredTensor(
+                checkpoint_file=path, key=key, location="cpu"
+            )
+        return tensors
+
     def __init__(self) -> None:
         self._unpatched_pickler = pickle.Unpickler
         self._unpatched_torch_rebuild = torch._utils._rebuild_tensor
+        self._unpatched_safetensors_load = safetensors.torch.load_file
         # HACK: Yeaaaaaaaaaah this isn't great
         defer_tensor_load._patched_load._unpatched = torch.load
 
@@ -220,10 +259,18 @@ class defer_tensor_load:
         torch._utils._rebuild_tensor = defer_tensor_load._patched_rebuild_tensor
         torch.load = defer_tensor_load._patched_load
 
+        transformers.modeling_utils.safe_load_file = (
+            defer_tensor_load._patched_safetensors_load
+        )
+        safetensors.torch.load_file = defer_tensor_load._patched_safetensors_load
+
     def __exit__(self, *args) -> None:
         pickle.Unpickler = self._unpatched_pickler
         torch._utils._rebuild_tensor = self._unpatched_torch_rebuild
         torch.load = defer_tensor_load._patched_load._unpatched
+
+        transformers.modeling_utils.safe_load_file = self._unpatched_safetensors_load
+        safetensors.torch.load_file = self._unpatched_safetensors_load
 
 
 class merge_with_secondary_models:
